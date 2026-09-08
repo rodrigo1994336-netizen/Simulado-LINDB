@@ -1,0 +1,140 @@
+name: PROVA v0.8 Isolated Emulator Handshake
+
+on:
+  push:
+    branches:
+      - prova-v08-emulator-ci
+    paths:
+      - .github/workflows/prova-v08-handshake.yml
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  emulator-gates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CI: "true"
+      HANDSHAKE_ISSUE: "1"
+      ARCHIVE_SHA256: "a00f8c3cc8a971047122c2af990bfa7f5aaf6b12438d5ad901eacd1da0edfbca"
+    steps:
+      - name: Checkout scratch branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate ephemeral key and wait for encrypted payload
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          umask 077
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out /tmp/prova-private.pem >/dev/null 2>&1
+          openssl pkey -in /tmp/prova-private.pem -pubout -out /tmp/prova-public.pem
+          PUB_B64="$(base64 -w0 /tmp/prova-public.pem)"
+          gh issue comment "$HANDSHAKE_ISSUE" --repo "$GITHUB_REPOSITORY" --body "PROVA_CI_PUBLIC_KEY_B64=${PUB_B64}"
+
+          files=(
+            prova-v08-key.enc.b64
+            prova-v08-payload.enc.b64.part00
+            prova-v08-payload.enc.b64.part01
+            prova-v08-payload.enc.b64.part02
+            prova-v08-payload.enc.b64.part03
+            prova-v08-payload.enc.b64.part04
+            prova-v08-payload.enc.b64.part05
+          )
+          found=0
+          for attempt in $(seq 1 120); do
+            git fetch origin "$GITHUB_REF_NAME" --quiet
+            found=1
+            for f in "${files[@]}"; do
+              git cat-file -e "origin/$GITHUB_REF_NAME:$f" 2>/dev/null || { found=0; break; }
+            done
+            [[ "$found" == 1 ]] && break
+            sleep 5
+          done
+          [[ "$found" == 1 ]] || { echo "Encrypted payload not received" >&2; exit 70; }
+
+          git show "origin/$GITHUB_REF_NAME:prova-v08-key.enc.b64" | base64 -d > /tmp/prova-key.enc
+          openssl pkeyutl -decrypt -inkey /tmp/prova-private.pem \
+            -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 \
+            -in /tmp/prova-key.enc -out /tmp/prova-key.txt
+          IFS=: read -r AES_KEY AES_IV < /tmp/prova-key.txt
+          [[ "$AES_KEY" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$AES_IV" =~ ^[0-9a-f]{32}$ ]]
+
+          : > /tmp/prova-payload.b64
+          for i in 00 01 02 03 04 05; do
+            git show "origin/$GITHUB_REF_NAME:prova-v08-payload.enc.b64.part${i}" >> /tmp/prova-payload.b64
+          done
+          base64 -d /tmp/prova-payload.b64 > /tmp/prova-payload.enc
+          openssl enc -d -aes-256-cbc -K "$AES_KEY" -iv "$AES_IV" \
+            -in /tmp/prova-payload.enc -out /tmp/prova-v08.tar.gz
+          test "$(sha256sum /tmp/prova-v08.tar.gz | awk '{print $1}')" = "$ARCHIVE_SHA256"
+          mkdir -p /tmp/prova-v08
+          tar -xzf /tmp/prova-v08.tar.gz -C /tmp/prova-v08
+          test ! -e /tmp/prova-v08/.firebaserc
+          ! find /tmp/prova-v08 -name .firebaserc -print -quit | grep -q .
+          rm -f /tmp/prova-key.txt /tmp/prova-key.enc /tmp/prova-payload.b64 /tmp/prova-payload.enc /tmp/prova-private.pem
+
+      - name: Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Scrub Firebase and Google credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          for n in FIREBASE_TOKEN GOOGLE_APPLICATION_CREDENTIALS CLOUDSDK_CORE_PROJECT CLOUDSDK_PROJECT GOOGLE_CLOUD_PROJECT GCLOUD_PROJECT; do
+            unset "$n" || true
+          done
+          env | cut -d= -f1 | grep -E '^(FIREBASE_TOKEN|GOOGLE_APPLICATION_CREDENTIALS|CLOUDSDK_CORE_PROJECT|CLOUDSDK_PROJECT|GOOGLE_CLOUD_PROJECT|GCLOUD_PROJECT)$' && exit 61 || true
+
+      - name: Install local dependencies and pinned Firebase CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --no-audit --no-fund --prefix /tmp/prova-v08/firebase/functions
+          npm install --no-audit --no-fund --prefix /tmp/prova-v08/firebase/tests/rules
+          npm install --no-audit --no-fund --prefix /tmp/prova-v08/firebase/tests/e2e
+          mkdir -p /tmp/prova-firebase-cli
+          npm install --no-audit --no-fund --prefix /tmp/prova-firebase-cli firebase-tools@15.29.0
+          echo "/tmp/prova-firebase-cli/node_modules/.bin" >> "$GITHUB_PATH"
+
+      - name: Confirm pinned CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(firebase --version)" = "15.29.0"
+
+      - name: Rules gate
+        shell: bash
+        working-directory: /tmp/prova-v08
+        run: |
+          set -o pipefail
+          env -u FIREBASE_TOKEN -u GOOGLE_APPLICATION_CREDENTIALS -u CLOUDSDK_CORE_PROJECT -u CLOUDSDK_PROJECT -u GOOGLE_CLOUD_PROJECT -u GCLOUD_PROJECT \
+            bash scripts/firebase/run-rules-tests.sh 2>&1 | tee /tmp/prova-rules.log
+          code=${PIPESTATUS[0]}
+          echo "RULES_EXIT=$code"
+          exit "$code"
+
+      - name: E2E gate
+        shell: bash
+        working-directory: /tmp/prova-v08
+        run: |
+          set -o pipefail
+          env -u FIREBASE_TOKEN -u GOOGLE_APPLICATION_CREDENTIALS -u CLOUDSDK_CORE_PROJECT -u CLOUDSDK_PROJECT -u GOOGLE_CLOUD_PROJECT -u GCLOUD_PROJECT \
+            bash scripts/firebase/run-emulator-e2e.sh 2>&1 | tee /tmp/prova-e2e.log
+          code=${PIPESTATUS[0]}
+          echo "E2E_EXIT=$code"
+          exit "$code"
