@@ -1,0 +1,10 @@
+{
+  "name": "ia-mastery-payment-bridge",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "@base44/sdk": "latest",
+    "stripe": "latest"
+  }
+}
