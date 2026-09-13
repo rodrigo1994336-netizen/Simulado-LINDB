@@ -1,29 +1,41 @@
 import http from "node:http";
-import Stripe from "stripe";
+import crypto from "node:crypto";
 import { createClient } from "@base44/sdk";
 
 const PORT = process.env.PORT || 10000;
 const APP_ID = process.env.BASE44_APP_ID;
 const BOT_EMAIL = process.env.BASE44_BOT_EMAIL;
 const BOT_PASSWORD = process.env.BASE44_BOT_PASSWORD;
-const WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
+const KIWIFY_SECRET = process.env.KIWIFY_WEBHOOK_SECRET;
+const KIWIFY_PRODUCT_ID = process.env.KIWIFY_PRODUCT_ID || "26d6b860-afba-11f1-b7e0-1b0e168672c7";
 const COURSE_VERSION = process.env.COURSE_VERSION || "1.0";
 const COURSE_PLAN = process.env.COURSE_PLAN || "launch-97";
 const COURSE_KEY = "ia-mastery-academy";
-const PAYMENT_LINK_ID = "plink_1UFJ6d1OT4dIOGZjKMNich7n";
-const EXPECTED_AMOUNT = 9700;
+const BASE44_REGISTER_URL = "https://fortunate-mastery-flow-labs.base44.app/register?returnTo=%2Fcurso";
 
 const json = (res, status, body) => {
   res.writeHead(status, { "content-type": "application/json; charset=utf-8" });
   res.end(JSON.stringify(body));
 };
-
 const norm = (v) => String(v || "").trim().toLowerCase();
+const safeString = (v) => String(v == null ? "" : v);
 
 async function raw(req) {
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
   return Buffer.concat(chunks);
+}
+
+function validKiwifySignature(body, url) {
+  if (!KIWIFY_SECRET) return false;
+  const supplied = norm(url.searchParams.get("signature"));
+  if (!/^[a-f0-9]{40}$/.test(supplied)) return false;
+  const expected = crypto.createHmac("sha1", KIWIFY_SECRET).update(body).digest("hex");
+  try {
+    return crypto.timingSafeEqual(Buffer.from(expected, "hex"), Buffer.from(supplied, "hex"));
+  } catch {
+    return false;
+  }
 }
 
 async function client() {
@@ -50,36 +62,48 @@ async function processed(b, eventId) {
   return rows.some((r) => r.event_id === eventId && r.processed === true);
 }
 
-async function logEvent(b, event, status, action, email = "") {
-  const o = event.data?.object || {};
+function kiwifyEventId(payload) {
+  return `kiwify:${safeString(payload.webhook_event_type || payload.event)}:${safeString(payload.order_id || payload.order_ref)}`;
+}
+
+function amountBrl(payload) {
+  const raw = payload?.Commissions?.charge_amount ?? payload?.Purchase?.original_offer_price ?? payload?.purchase?.original_offer_price ?? 0;
+  const n = Number(String(raw).replace(",", "."));
+  return Number.isFinite(n) ? n : 0;
+}
+
+async function logEvent(b, payload, status, action, email = "") {
+  const eventType = safeString(payload.webhook_event_type || payload.event);
+  const eventId = kiwifyEventId(payload);
   await b.entities.PaymentEvent.create({
-    provider: "stripe",
-    event_id: event.id,
-    event_type: event.type,
-    order_id: o.id || "",
-    customer_email: email || o.customer_details?.email || o.customer_email || "",
-    product_id: COURSE_KEY,
-    amount: (o.amount_total || o.amount || 0) / 100,
-    currency: o.currency || "brl",
+    provider: "kiwify",
+    event_id: eventId,
+    event_type: eventType,
+    order_id: safeString(payload.order_id || payload.order_ref),
+    customer_email: email || payload?.Customer?.email || payload?.customer?.email || "",
+    product_id: safeString(payload?.Product?.product_id || payload?.product?.product_id),
+    amount: amountBrl(payload),
+    currency: "brl",
     status,
     processed: true,
     action,
-    received_at: new Date(event.created * 1000).toISOString(),
+    received_at: new Date().toISOString(),
     processed_at: new Date().toISOString(),
-    payload_hash: event.id,
+    payload_hash: crypto.createHash("sha256").update(JSON.stringify(payload)).digest("hex"),
   });
 }
 
-async function upsertEntitlement(b, email, o, eventId) {
+async function upsertEntitlement(b, email, payload, eventId) {
   const rows = await b.entities.Entitlement.list();
   const existing = rows.find((r) => norm(r.account_email) === norm(email));
+  const orderId = safeString(payload.order_id || payload.order_ref);
   const patch = {
     status: "active",
     plan: COURSE_PLAN,
-    provider: "stripe",
-    external_reference: o.id,
-    payment_reference: String(o.payment_intent || ""),
-    customer_reference: String(o.customer || ""),
+    provider: "kiwify",
+    external_reference: orderId,
+    payment_reference: safeString(payload.payment_merchant_id || payload.order_ref || orderId),
+    customer_reference: norm(email),
     last_event_reference: eventId,
     course_version: COURSE_VERSION,
     course_payload_json: JSON.stringify({ course: COURSE_KEY, version: COURSE_VERSION, modules: 16 }),
@@ -90,13 +114,13 @@ async function upsertEntitlement(b, email, o, eventId) {
   return b.entities.Entitlement.create({ account_email: norm(email), ...patch });
 }
 
-async function revokeByPayment(b, paymentRef, eventId) {
-  if (!paymentRef) return false;
+async function revokeByOrder(b, orderId, eventId, finalStatus = "revoked") {
+  if (!orderId) return false;
   const rows = await b.entities.Entitlement.list();
-  const e = rows.find((r) => r.payment_reference === String(paymentRef));
+  const e = rows.find((r) => r.provider === "kiwify" && r.external_reference === String(orderId));
   if (!e) return false;
   await b.entities.Entitlement.update(e.id, {
-    status: "revoked",
+    status: finalStatus === "refunded" ? "refunded" : "revoked",
     last_event_reference: eventId,
     updated_at: new Date().toISOString(),
   });
@@ -104,30 +128,27 @@ async function revokeByPayment(b, paymentRef, eventId) {
   return true;
 }
 
-function isCourseCheckout(o) {
-  return o.metadata?.course === COURSE_KEY &&
-    o.metadata?.offer === COURSE_PLAN &&
-    o.payment_link === PAYMENT_LINK_ID &&
-    Number(o.amount_total || 0) === EXPECTED_AMOUNT &&
-    norm(o.currency) === "brl";
+function productMatches(payload) {
+  const id = safeString(payload?.Product?.product_id || payload?.product?.product_id);
+  return id === KIWIFY_PRODUCT_ID;
 }
 
 async function reconcile(b) {
   const rows = await b.entities.Entitlement.list();
   let activated = 0;
   for (const e of rows) {
-    if (e.status !== "active") continue;
+    if (e.provider !== "kiwify" || e.status !== "active") continue;
     try {
       if (await setAccess(b, e.account_email, "active", e.plan || COURSE_PLAN)) activated++;
     } catch (err) {
       console.error("RECONCILE_USER_FAILED", err?.message || String(err));
     }
   }
-  return { active: rows.filter((e) => e.status === "active").length, activated };
+  return { active: rows.filter((e) => e.provider === "kiwify" && e.status === "active").length, activated };
 }
 
 function retryReconcile() {
-  for (const ms of [5000, 30000, 120000, 300000, 600000]) {
+  for (const ms of [5000, 30000, 120000, 300000, 600000, 1800000]) {
     const t = setTimeout(async () => {
       try {
         const b = await client();
@@ -140,43 +161,52 @@ function retryReconcile() {
   }
 }
 
-async function handleEvent(event) {
+async function handleKiwify(payload) {
   const b = await client();
-  if (await processed(b, event.id)) return { ok: true, duplicate: true };
-  const o = event.data?.object || {};
+  const eventType = norm(payload.webhook_event_type || payload.event);
+  const eventId = kiwifyEventId(payload);
+  if (await processed(b, eventId)) return { ok: true, duplicate: true };
 
-  if (event.type === "checkout.session.completed" || event.type === "checkout.session.async_payment_succeeded") {
-    if (!isCourseCheckout(o)) {
-      await logEvent(b, event, "ignored_non_course_checkout", "ignore");
-      return { ok: true, ignored: true };
-    }
-    const paid = event.type === "checkout.session.async_payment_succeeded" || o.payment_status === "paid";
-    const email = o.customer_details?.email || o.customer_email;
-    if (!paid || !email) {
-      await logEvent(b, event, paid ? "missing_email" : "not_paid", "ignore", email || "");
+  if (!productMatches(payload)) {
+    await logEvent(b, payload, "ignored_non_course_product", "ignore");
+    return { ok: true, ignored: true };
+  }
+
+  if (payload.is_test === true || payload.test === true) {
+    await logEvent(b, payload, "test", "ignore");
+    return { ok: true, test: true };
+  }
+
+  const email = payload?.Customer?.email || payload?.customer?.email || "";
+  const orderId = safeString(payload.order_id || payload.order_ref);
+
+  if (eventType === "order_approved") {
+    if (norm(payload.order_status) !== "paid" || !email) {
+      await logEvent(b, payload, !email ? "missing_email" : "not_paid", "ignore", email);
       return { ok: true, activated: false };
     }
-    await upsertEntitlement(b, email, o, event.id);
+    await upsertEntitlement(b, email, payload, eventId);
     let activated = false;
-    try { activated = await setAccess(b, email, "active"); } catch (err) { console.error("SET_ACCESS_FAILED", err?.message || String(err)); }
+    try { activated = await setAccess(b, email, "active"); }
+    catch (err) { console.error("SET_ACCESS_FAILED", err?.message || String(err)); }
     if (!activated) retryReconcile();
-    await logEvent(b, event, "paid", activated ? "grant_access" : "pending_registration", email);
+    await logEvent(b, payload, "paid", activated ? "grant_access" : "pending_registration", email);
     return { ok: true, entitlement: true, user_activated: activated };
   }
 
-  if (["charge.refunded", "refund.created", "refund.updated"].includes(event.type)) {
-    const changed = await revokeByPayment(b, o.payment_intent || o.charge || "", event.id);
-    await logEvent(b, event, "refunded", changed ? "revoke_access" : "no_match");
+  if (eventType === "order_refunded") {
+    const changed = await revokeByOrder(b, orderId, eventId, "refunded");
+    await logEvent(b, payload, "refunded", changed ? "revoke_access" : "no_match", email);
     return { ok: true, revoked: changed };
   }
 
-  if (event.type === "charge.dispute.created") {
-    const changed = await revokeByPayment(b, o.payment_intent || "", event.id);
-    await logEvent(b, event, "disputed", changed ? "revoke_access" : "no_match");
+  if (eventType === "chargeback") {
+    const changed = await revokeByOrder(b, orderId, eventId, "revoked");
+    await logEvent(b, payload, "chargeback", changed ? "revoke_access" : "no_match", email);
     return { ok: true, revoked: changed };
   }
 
-  await logEvent(b, event, "ignored", "ignore");
+  await logEvent(b, payload, "ignored", "ignore", email);
   return { ok: true, ignored: true };
 }
 
@@ -187,25 +217,46 @@ async function ready() {
   const modules = await b.entities.CourseModule.list();
   if (modules.length !== 16) throw new Error(`COURSE_MODULE_COUNT_${modules.length}`);
   await b.entities.User.update(bot.id, { preferred_locale: bot.preferred_locale || "pt-BR" });
-  return { ok: true, base44_authenticated: true, bot_admin: true, user_update_writable: true, course_modules: 16, reconciliation: await reconcile(b) };
+  return {
+    ok: true,
+    provider: "kiwify",
+    base44_authenticated: true,
+    bot_admin: true,
+    user_update_writable: true,
+    course_modules: 16,
+    product_id: KIWIFY_PRODUCT_ID,
+    reconciliation: await reconcile(b),
+  };
 }
 
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
     if (req.method === "GET" && url.pathname === "/health") {
-      return json(res, 200, { ok: true, service: "ia-mastery-payment-bridge", configured: Boolean(APP_ID && BOT_EMAIL && BOT_PASSWORD && WEBHOOK_SECRET) });
+      return json(res, 200, {
+        ok: true,
+        service: "ia-mastery-payment-bridge",
+        provider: "kiwify",
+        configured: Boolean(APP_ID && BOT_EMAIL && BOT_PASSWORD && KIWIFY_SECRET && KIWIFY_PRODUCT_ID),
+      });
     }
     if (req.method === "GET" && url.pathname === "/ready") return json(res, 200, await ready());
-    if (req.method === "POST" && url.pathname === "/stripe/webhook") {
-      if (!WEBHOOK_SECRET) return json(res, 503, { ok: false, error: "WEBHOOK_SECRET_MISSING" });
+    if (req.method === "GET" && url.pathname === "/purchase-success") {
+      retryReconcile();
+      res.writeHead(302, { location: BASE44_REGISTER_URL, "cache-control": "no-store" });
+      return res.end();
+    }
+    if (req.method === "POST" && url.pathname === "/kiwify/webhook") {
+      if (!KIWIFY_SECRET) return json(res, 503, { ok: false, error: "KIWIFY_SECRET_MISSING" });
       const body = await raw(req);
-      const sig = req.headers["stripe-signature"];
-      if (!sig) return json(res, 400, { ok: false, error: "SIGNATURE_MISSING" });
-      let event;
-      try { event = Stripe.webhooks.constructEvent(body, sig, WEBHOOK_SECRET); }
-      catch { return json(res, 400, { ok: false, error: "INVALID_SIGNATURE" }); }
-      return json(res, 200, await handleEvent(event));
+      if (!validKiwifySignature(body, url)) return json(res, 401, { ok: false, error: "INVALID_SIGNATURE" });
+      let payload;
+      try { payload = JSON.parse(body.toString("utf8")); }
+      catch { return json(res, 400, { ok: false, error: "INVALID_JSON" }); }
+      return json(res, 200, await handleKiwify(payload));
+    }
+    if (req.method === "POST" && url.pathname === "/stripe/webhook") {
+      return json(res, 410, { ok: false, error: "STRIPE_DISABLED_USE_KIWIFY" });
     }
     return json(res, 404, { ok: false, error: "NOT_FOUND" });
   } catch (err) {
@@ -214,4 +265,4 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, "0.0.0.0", () => console.log(`IA Mastery guarded bridge listening on ${PORT}`));
+server.listen(PORT, "0.0.0.0", () => console.log(`IA Mastery Kiwify bridge listening on ${PORT}`));
