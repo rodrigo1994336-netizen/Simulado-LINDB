@@ -21,6 +21,10 @@ async function readRawBody(req) {
   return Buffer.concat(chunks);
 }
 
+function normalizeEmail(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
 async function getBase44() {
   if (!BASE44_APP_ID || !BASE44_BOT_EMAIL || !BASE44_BOT_PASSWORD) {
     throw new Error("BASE44_CONFIG_MISSING");
@@ -46,21 +50,45 @@ async function coursePayload(base44) {
   });
 }
 
+async function findUserByEmail(base44, email) {
+  const normalized = normalizeEmail(email);
+  if (!normalized) return null;
+  const users = await base44.entities.User.list();
+  return users.find((user) => normalizeEmail(user.email) === normalized) || null;
+}
+
+async function setUserCourseAccess(base44, email, access, plan = COURSE_PLAN) {
+  try {
+    const user = await findUserByEmail(base44, email);
+    if (!user) return { matched: false, updated: false };
+    await base44.entities.User.update(user.id, {
+      course_access: access,
+      course_plan: plan,
+    });
+    return { matched: true, updated: true, user_id: user.id };
+  } catch (error) {
+    console.error("USER_ACCESS_UPDATE_FAILED", error);
+    return { matched: false, updated: false, error: error?.message || String(error) };
+  }
+}
+
 async function upsertEntitlement(base44, email, patch) {
   const rows = await base44.entities.Entitlement.list();
-  const normalized = email.toLowerCase();
+  const normalized = normalizeEmail(email);
   const existing = rows.find(
-    (row) => (row.account_email || "").toLowerCase() === normalized,
+    (row) => normalizeEmail(row.account_email) === normalized,
   );
 
   if (existing) {
-    return base44.entities.Entitlement.update(existing.id, patch);
+    const updated = await base44.entities.Entitlement.update(existing.id, patch);
+    return { record: updated, created: false };
   }
 
-  return base44.entities.Entitlement.create({
+  const created = await base44.entities.Entitlement.create({
     account_email: normalized,
     ...patch,
   });
+  return { record: created, created: true };
 }
 
 async function revokeByPaymentReference(base44, paymentReference, status, eventId) {
@@ -71,11 +99,21 @@ async function revokeByPaymentReference(base44, paymentReference, status, eventI
   );
   if (!existing) return null;
 
-  return base44.entities.Entitlement.update(existing.id, {
+  const updated = await base44.entities.Entitlement.update(existing.id, {
     status,
     last_event_reference: eventId,
     updated_at: new Date().toISOString(),
   });
+
+  const userAccess = status === "refunded" ? "revoked" : "revoked";
+  const userResult = await setUserCourseAccess(
+    base44,
+    existing.account_email,
+    userAccess,
+    existing.plan || COURSE_PLAN,
+  );
+
+  return { entitlement: updated, userResult };
 }
 
 async function logPaymentEvent(base44, event, fields = {}) {
@@ -128,7 +166,7 @@ async function processStripeEvent(event) {
     }
 
     const payload = await coursePayload(base44);
-    await upsertEntitlement(base44, email, {
+    const entitlement = await upsertEntitlement(base44, email, {
       status: "active",
       plan: COURSE_PLAN,
       provider: "stripe",
@@ -142,14 +180,23 @@ async function processStripeEvent(event) {
       updated_at: new Date().toISOString(),
     });
 
+    const userResult = await setUserCourseAccess(base44, email, "active", COURSE_PLAN);
+
     await logPaymentEvent(base44, event, {
       email,
       processed: true,
       status: "paid",
-      action: "grant_access",
+      action: userResult.updated
+        ? "grant_access_and_activate_user"
+        : "grant_entitlement_pending_registration",
     });
 
-    return { ok: true, activated: true };
+    return {
+      ok: true,
+      activated: true,
+      entitlement_created: entitlement.created,
+      user_activated: userResult.updated,
+    };
   }
 
   if (
