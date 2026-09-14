@@ -6,6 +6,7 @@ const PORT = process.env.PORT || 10000;
 const APP_ID = process.env.BASE44_APP_ID;
 const BOT_EMAIL = process.env.BASE44_BOT_EMAIL;
 const BOT_PASSWORD = process.env.BASE44_BOT_PASSWORD;
+const ACCESS_TOKEN = process.env.BASE44_ACCESS_TOKEN;
 const KIWIFY_SECRET = process.env.KIWIFY_WEBHOOK_SECRET;
 const KIWIFY_PRODUCT_ID = process.env.KIWIFY_PRODUCT_ID || "26d6b860-afba-11f1-b7e0-1b0e168672c7";
 const COURSE_VERSION = process.env.COURSE_VERSION || "1.0";
@@ -39,7 +40,9 @@ function validKiwifySignature(body, url) {
 }
 
 async function client() {
-  if (!APP_ID || !BOT_EMAIL || !BOT_PASSWORD) throw new Error("BASE44_CONFIG_MISSING");
+  if (!APP_ID) throw new Error("BASE44_APP_ID_MISSING");
+  if (ACCESS_TOKEN) return createClient({ appId: APP_ID, token: ACCESS_TOKEN });
+  if (!BOT_EMAIL || !BOT_PASSWORD) throw new Error("BASE44_CONFIG_MISSING");
   const b = createClient({ appId: APP_ID });
   await b.auth.loginViaEmailPassword(BOT_EMAIL, BOT_PASSWORD);
   return b;
@@ -237,7 +240,7 @@ const server = http.createServer(async (req, res) => {
         ok: true,
         service: "ia-mastery-payment-bridge",
         provider: "kiwify",
-        configured: Boolean(APP_ID && BOT_EMAIL && BOT_PASSWORD && KIWIFY_SECRET && KIWIFY_PRODUCT_ID),
+        configured: Boolean(APP_ID && (ACCESS_TOKEN || (BOT_EMAIL && BOT_PASSWORD)) && KIWIFY_SECRET && KIWIFY_PRODUCT_ID),
       });
     }
     if (req.method === "GET" && url.pathname === "/ready") return json(res, 200, await ready());
