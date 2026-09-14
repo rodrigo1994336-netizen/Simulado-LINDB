@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import { createClient } from "@base44/sdk";
 
-const RUN = process.env.RUN_SELFTEST === "1";
+const RUN = true;
 const PORT = process.env.PORT || 10000;
 const APP_ID = process.env.BASE44_APP_ID;
 const ACCESS_TOKEN = process.env.BASE44_ACCESS_TOKEN;
