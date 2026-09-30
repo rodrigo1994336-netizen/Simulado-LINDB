@@ -11,6 +11,7 @@ const KIWIFY_SECRET = process.env.KIWIFY_WEBHOOK_SECRET;
 const KIWIFY_PRODUCT_ID = process.env.KIWIFY_PRODUCT_ID || "26d6b860-afba-11f1-b7e0-1b0e168672c7";
 const OWNER_EMAIL = normEnv(process.env.OWNER_EMAIL || "rodrigo1994336@gmail.com");
 const ADMIN_SESSION_SECRET = process.env.ADMIN_SESSION_SECRET || KIWIFY_SECRET || "";
+const TECHNICAL_ADMIN_EMAILS = new Set([normEnv(BOT_EMAIL), "ricteste.afiliacao@gmail.com", "ricteste.afiliacao+payments@gmail.com"].filter(Boolean));
 function normEnv(v){ return String(v || "").trim().toLowerCase(); }
 const COURSE_VERSION = process.env.COURSE_VERSION || "1.0";
 const COURSE_PLAN = process.env.COURSE_PLAN || "launch-97";
@@ -98,18 +99,22 @@ function adminDashboardPage(){ return "<!doctype html><html lang=\"pt-BR\"><head
 async function enforceOwnerAdmin(b) {
   const users = await b.entities.User.list();
   const owner = users.find((u) => norm(u.email) === OWNER_EMAIL);
-  if (owner && owner.role !== "admin") await b.entities.User.update(owner.id, { role: "admin" });
+  if (owner) await b.entities.User.update(owner.id, { role: "admin", course_access: "active", course_plan: "owner" });
   for (const u of users) {
     const email = norm(u.email);
-    if (u.role === "admin" && email !== OWNER_EMAIL && email !== norm(BOT_EMAIL)) {
+    if (TECHNICAL_ADMIN_EMAILS.has(email) && u.role !== "admin") {
+      await b.entities.User.update(u.id, { role: "admin" });
+      continue;
+    }
+    if (u.role === "admin" && email !== OWNER_EMAIL && !TECHNICAL_ADMIN_EMAILS.has(email)) {
       await b.entities.User.update(u.id, { role: "user" });
     }
   }
   const refreshed = await b.entities.User.list();
   return {
     owner_admin: Boolean(refreshed.find((u) => norm(u.email) === OWNER_EMAIL && u.role === "admin")),
-    technical_admin: norm(BOT_EMAIL),
-    human_admins: refreshed.filter((u) => u.role === "admin" && norm(u.email) !== norm(BOT_EMAIL)).map((u) => u.email),
+    technical_admins: refreshed.filter((u) => u.role === "admin" && TECHNICAL_ADMIN_EMAILS.has(norm(u.email))).map((u) => u.email),
+    human_admins: refreshed.filter((u) => u.role === "admin" && !TECHNICAL_ADMIN_EMAILS.has(norm(u.email))).map((u) => u.email),
   };
 }
 
@@ -329,13 +334,13 @@ const server = http.createServer(async (req, res) => {
         ok: true,
         admin: adminState,
         stats: {
-          total: users.filter((u) => norm(u.email) !== norm(BOT_EMAIL)).length,
+          total: users.filter((u) => !TECHNICAL_ADMIN_EMAILS.has(norm(u.email))).length,
           active: users.filter((u) => u.course_access === "active").length,
           trial: users.filter((u) => u.course_access === "trial").length,
           revoked: users.filter((u) => u.course_access === "revoked").length,
           sales: events.filter((e) => e.status === "paid").length
         },
-        users: users.filter((u) => norm(u.email) !== norm(BOT_EMAIL)).map((u) => ({
+        users: users.filter((u) => !TECHNICAL_ADMIN_EMAILS.has(norm(u.email))).map((u) => ({
           id: u.id, email: u.email, full_name: u.full_name, role: u.role, course_access: u.course_access || "none",
           course_plan: u.course_plan || "", access_expires_at: u.access_expires_at || ""
         })),
